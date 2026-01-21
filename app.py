@@ -117,7 +117,7 @@ CORS(app, resources={
 
 # Load Model
 try:
-    model = tf.keras.models.load_model("models/plant_disease (1).keras")
+    model = tf.keras.models.load_model("models/plant_disease_recog_model_pwp.keras")
     logger.info("✅ Model loaded successfully")
 except Exception as e:
     logger.error(f"❌ Model loading failed: {e}")
@@ -358,4 +358,5 @@ if __name__ == "__main__":
     # Production (uncomment and use gunicorn instead)
     # from waitress import serve
     # serve(app, host='0.0.0.0', port=8080)
+
 
