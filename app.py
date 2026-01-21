@@ -88,164 +88,248 @@
     
 # if __name__ == '__main__':
 #     app.run(debug=True, port=8080)  # Ya koi free port
-import os
-import json
-import uuid
-import logging
-from datetime import datetime
-
-import numpy as np
-import tensorflow as tf
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-# ================= CONFIG =================
-PORT = int(os.environ.get("PORT", 8080))
-UPLOAD_DIR = "uploadimages"
-MODEL_PATH = "models/plant_disease_recog_model_pwp.keras"
-DATA_PATH = "plant_disease.json"
+import numpy as np
+import json
+import uuid
+import os
+import tensorflow as tf
+from datetime import datetime
+import logging
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# ================= LOGGING =================
+# Setup logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("PHASAL")
+logger = logging.getLogger(__name__)
 
-# ================= APP =================
 app = Flask(__name__)
+
+# CORS Configuration
 CORS(app, resources={
     r"/api/*": {
-        "origins": [
-            "http://localhost:5173",
-            "http://localhost:3000",
-            "http://127.0.0.1:5173",
-            "https://phasalaipr.onrender.com"
-        ]
+        "origins": ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173","https://phasalaipr.onrender.com"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
     }
 })
 
-# ================= GLOBALS (LAZY LOAD) =================
-model = None
-plant_disease = {}
+# Load Model
+try:
+    model = tf.keras.models.load_model("models/plant_disease_recog_model_pwp.keras")
+    logger.info("✅ Model loaded successfully")
+except Exception as e:
+    logger.error(f"❌ Model loading failed: {e}")
+    model = None
 
-# ================= HELPERS =================
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+# Load Disease Data
+try:
+    with open("plant_disease.json", "r", encoding="utf-8") as f:
+        plant_disease = json.load(f)
+    logger.info(f"✅ Disease data loaded: {len(plant_disease)} classes")
+except Exception as e:
+    logger.error(f"❌ Disease data loading failed: {e}")
+    plant_disease = {}
 
-def validate_image_file(file):
-    if not file or file.filename == "":
-        return False, "No file selected"
+# Upload Directory
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploadimages")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+logger.info(f"✅ Upload directory: {UPLOAD_DIR}")
 
-    if not allowed_file(file.filename):
-        return False, "Only JPG / PNG allowed"
+# Config
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png"}
 
-    file.seek(0, os.SEEK_END)
-    size = file.tell()
-    file.seek(0)
+# Error Handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Error: {str(e)}", exc_info=True)
+    return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
-    if size > MAX_FILE_SIZE:
-        return False, "File too large (max 10MB)"
-
-    return True, "Valid"
-
-def load_model_once():
-    global model
-    if model is None:
-        logger.info("🔄 Loading TensorFlow model...")
-        model = tf.keras.models.load_model(MODEL_PATH)
-        logger.info("✅ Model loaded successfully")
-    return model
-
-def load_disease_data():
-    global plant_disease
-    if not plant_disease:
-        with open(DATA_PATH, "r", encoding="utf-8") as f:
-            plant_disease = json.load(f)
-
-def preprocess_image(image_path):
-    # ⚠️ FIXED SIZE (do NOT use model.input_shape on Render)
-    image = tf.keras.utils.load_img(image_path, target_size=(224, 224))
-    image_array = tf.keras.utils.img_to_array(image) / 255.0
-    return np.expand_dims(image_array, axis=0).astype(np.float32)
-
-# ================= ROUTES =================
-
+# Health Check
 @app.get("/api/health")
 def health():
+    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
         "model_loaded": model is not None,
+        "classes": len(plant_disease),
         "timestamp": datetime.now().isoformat()
     }), 200
 
-@app.post("/api/predict")
-def api_predict():
+# Serve Uploaded Images
+@app.get("/uploadimages/<path:filename>")
+def uploaded_images(filename):
+    """Serve uploaded leaf images"""
     try:
-        if "img" not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
+        return send_from_directory(UPLOAD_DIR, filename)
+    except Exception as e:
+        return jsonify({"error": "File not found"}), 404
 
-        file = request.files["img"]
-        ok, msg = validate_image_file(file)
-        if not ok:
-            return jsonify({"error": msg}), 400
+# Validation
+def allowed_file(filename):
+    """Check if file extension is allowed"""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-        ext = os.path.splitext(file.filename)[1].lower()
-        filename = secure_filename(f"leaf_{uuid.uuid4().hex}{ext}")
-        save_path = os.path.join(UPLOAD_DIR, filename)
-        file.save(save_path)
+def validate_image_file(file):
+    """Validate uploaded image"""
+    if not file or file.filename == "":
+        return False, "No file selected"
+    
+    if not allowed_file(file.filename):
+        return False, "Only JPG/PNG files allowed"
+    
+    if len(file.read()) > MAX_FILE_SIZE:
+        file.seek(0)
+        return False, "File too large (max 10MB)"
+    
+    file.seek(0)
+    return True, "Valid"
 
-        logger.info(f"📸 Image saved: {filename}")
+# Image Processing
+def preprocess_image(image_path: str):
+    """Load and preprocess image for model"""
+    try:
+        # Get model input shape
+        input_shape = model.input_shape
+        target_size = (input_shape[1], input_shape[2])
+        
+        # Load image
+        image = tf.keras.utils.load_img(image_path, target_size=target_size)
+        image_array = tf.keras.utils.img_to_array(image)
+        image_batch = np.expand_dims(image_array, axis=0).astype(np.float32)
+        
+        # Normalize if needed (check if model expects normalized input)
+        # Uncomment if model was trained on normalized data (0-1 range)
+        # image_batch = image_batch / 255.0
+        
+        return image_batch
+    except Exception as e:
+        logger.error(f"Image preprocessing error: {e}")
+        raise
 
-        # Lazy load (VERY IMPORTANT for Render)
-        load_disease_data()
-        mdl = load_model_once()
-
-        preds = mdl.predict(preprocess_image(save_path), verbose=0)[0]
-        class_idx = int(np.argmax(preds))
-        confidence = float(preds[class_idx])
-
-        if isinstance(plant_disease, list):
-            disease_info = plant_disease[class_idx] if class_idx < len(plant_disease) else {}
-        else:
-            disease_info = plant_disease.get(str(class_idx), {})
-
+# Prediction
+def get_prediction(image_path: str):
+    """Get model prediction"""
+    if not model:
+        raise Exception("Model not loaded")
+    
+    try:
+        # Preprocess
+        processed_image = preprocess_image(image_path)
+        
+        # Predict
+        predictions = model.predict(processed_image, verbose=0)
+        probs = predictions[0].astype(float)
+        
+        # Get class index
+        class_idx = int(np.argmax(probs))
+        confidence = float(probs[class_idx])
+        
+        # Get top 3 predictions
+        top_3_idx = np.argsort(probs)[-3:][::-1].tolist()
+        
+        # Get disease info
+        disease_info = plant_disease[class_idx] if isinstance(plant_disease, list) else plant_disease.get(str(class_idx), plant_disease.get(class_idx, {}))
+        
+        # Handle string responses
+        if isinstance(disease_info, str):
+            disease_info = {"name": disease_info, "cause": "Unknown", "cure": "Unknown"}
+        
+        # Ensure all fields exist
         disease_info.setdefault("name", f"Class {class_idx}")
         disease_info.setdefault("cause", "Information not available")
         disease_info.setdefault("cure", "Information not available")
-
-        return jsonify({
-            "result": True,
-            "classIndex": class_idx,
+        
+        return {
+            "class_idx": class_idx,
             "confidence": confidence,
-            "prediction": disease_info,
-            "probs": preds.tolist(),
-            "imageUrl": f"{request.host_url.rstrip('/')}/uploadimages/{filename}",
-            "timestamp": datetime.now().isoformat()
-        }), 200
-
+            "disease_info": disease_info,
+            "probabilities": probs.tolist(),
+            "top_3": top_3_idx
+        }
     except Exception as e:
-        logger.error("❌ Prediction failed", exc_info=True)
-        return jsonify({"error": "Prediction failed"}), 500
+        logger.error(f"Prediction error: {e}")
+        raise
 
-@app.get("/uploadimages/<path:filename>")
-def uploaded_images(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
+# Main Prediction Endpoint
+@app.post("/api/predict")
+def api_predict():
+    """Main prediction endpoint"""
+    try:
+        # Validate request
+        if "img" not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files["img"]
+        
+        # Validate file
+        is_valid, message = validate_image_file(file)
+        if not is_valid:
+            return jsonify({"error": message}), 400
+        
+        # Save file
+        ext = os.path.splitext(file.filename)[1].lower()
+        filename = secure_filename(f"leaf_{uuid.uuid4().hex}{ext}")
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        
+        try:
+            file.save(save_path)
+            logger.info(f"File saved: {filename}")
+        except Exception as e:
+            logger.error(f"File save error: {e}")
+            return jsonify({"error": "Failed to save image"}), 500
+        
+        # Get prediction
+        try:
+            pred_result = get_prediction(save_path)
+        except Exception as e:
+            logger.error(f"Prediction failed: {e}")
+            return jsonify({"error": "Prediction failed", "details": str(e)}), 500
+        
+        # Build image URL
+        base_url = request.host_url.rstrip("/")
+        image_url = f"{base_url}/uploadimages/{filename}"
+        
+        # Build response
+        response = {
+            "result": True,
+            "classIndex": pred_result["class_idx"],
+            "prediction": pred_result["disease_info"],
+            "confidence": pred_result["confidence"],
+            "imageUrl": image_url,
+            "probs": pred_result["probabilities"],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        logger.info(f"Prediction success: Class {pred_result['class_idx']} ({pred_result['confidence']:.2%})")
+        
+        return jsonify(response), 200
+    
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
+# Stats Endpoint (optional)
 @app.get("/api/stats")
 def stats():
-    return jsonify({
-        "uploads_stored": len(os.listdir(UPLOAD_DIR)),
-        "total_classes": len(plant_disease),
-        "model_ready": model is not None,
-        "version": "1.0.0"
-    })
+    """Get app statistics"""
+    try:
+        uploaded_count = len(os.listdir(UPLOAD_DIR)) if os.path.exists(UPLOAD_DIR) else 0
+        return jsonify({
+            "total_classes": len(plant_disease),
+            "uploads_stored": uploaded_count,
+            "model_ready": model is not None,
+            "version": "1.0.0"
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+# Root Endpoint
 @app.get("/")
 def root():
+    """Root endpoint"""
     return jsonify({
         "message": "PHASAL - Plant Disease Detection API",
         "endpoints": {
@@ -254,8 +338,25 @@ def root():
             "stats": "/api/stats",
             "images": "/uploadimages/<filename>"
         }
-    })
+    }), 200
 
-# ================= RUN =================
+# 404 Handler
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+# 405 Handler
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+# Production Run
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    # Development
+    app.run(debug=True, host="0.0.0.0", port=8080)
+    
+    # Production (uncomment and use gunicorn instead)
+    # from waitress import serve
+    # serve(app, host='0.0.0.0', port=8080)
+
+
